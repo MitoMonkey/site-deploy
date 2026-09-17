@@ -36,6 +36,11 @@ Nach einem clean-slate-Lauf prüft er, dass auf dem Server nur noch Einträge
 liegen, die aus diesem Upload stammen. Ist das Leeren teilweise gescheitert,
 wird der Lauf rot und nennt die Reste.
 
+Ein Build kann Warnungen melden, indem er je eine Zeile an die Datei in
+`$BUILD_WARNINGS_FILE` anhängt. Der Deploy läuft trotzdem, danach wird der Lauf
+aber rot – damit GitHub eine Fehler-Mail schickt. Die Meldung sagt dann
+ausdrücklich, dass die Seite live ist.
+
 ## Eine Website anschließen
 
 1. **FTP-Zusatzkonto anlegen** (KAS → FTP → „Neues FTP-Konto“), eingeschränkt

@@ -125,6 +125,10 @@ jobs:
         if: inputs.build-command != ''
         # Explicit bash adds pipefail, so a failing command in a pipe fails the build.
         shell: bash
+        env:
+          # Builds may append one line per warning here. Warnings do not stop
+          # the deploy, but turn the run red afterwards so GitHub sends a mail.
+          BUILD_WARNINGS_FILE: ${{ runner.temp }}/build-warnings.txt
         run: ${{ inputs.build-command }}
 
       - name: Deploy
@@ -169,6 +173,18 @@ jobs:
           done <<< "$listing"
           if [ -n "$leftover" ]; then
             echo "::error::clean-slate did not remove:$leftover"
+            exit 1
+          fi
+
+      - name: Report build warnings
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        run: |
+          file="$RUNNER_TEMP/build-warnings.txt"
+          if [ -s "$file" ]; then
+            count=$(wc -l < "$file" | tr -d " ")
+            echo "::error::Site was deployed, but the build reported $count warning(s):"
+            # GitHub shows at most 10 annotations per step, so list all of them here.
+            cat "$file"
             exit 1
           fi
 
