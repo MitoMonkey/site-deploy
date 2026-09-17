@@ -1,0 +1,177 @@
+name: FTP deploy (reusable)
+
+# Called from each website repo. Builds optionally, then uploads to the
+# all-inkl webspace via FTPS. Only changed files are transferred. Deletions are
+# derived from a state file the action keeps on the server. The action silently
+# treats any failure to read that file, or to wipe the server on clean-slate, as
+# a first deploy. The check steps around it turn both cases into a red run.
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: Shell command that produces the site. Empty = no build.
+        type: string
+        default: ""
+      node-version:
+        type: string
+        default: "24"
+      publish-dir:
+        description: Directory to upload, relative to repo root, with trailing slash.
+        type: string
+        default: "./"
+      exclude:
+        description: Extra glob patterns (one per line, relative to publish-dir).
+        type: string
+        default: ""
+      clean-slate:
+        description: Wipe the whole server dir before uploading.
+        type: boolean
+        default: false
+    secrets:
+      # Hostname of the form w0xxxxxx.kasserver.com; the TLS certificate is
+      # only valid for *.kasserver.com.
+      FTP_SERVER:
+        required: true
+      FTP_USERNAME:
+        required: true
+      FTP_PASSWORD:
+        required: true
+      # Relative to the FTP login dir, ending in "/". With a per-domain FTP
+      # account the login dir is the webroot, so this is "./".
+      FTP_SERVER_DIR:
+        required: true
+
+env:
+  STATE_FILE: .ftp-deploy-sync-state.json
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # A newer push replaces a still pending run instead of queueing behind it.
+    # The running upload is never cancelled: aborting midway would leave the
+    # server state file out of sync with the files actually present.
+    concurrency:
+      group: ftp-deploy-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check secrets
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_SERVER_DIR: ${{ secrets.FTP_SERVER_DIR }}
+          CLEAN_SLATE: ${{ inputs.clean-slate }}
+        run: |
+          missing=""
+          for v in FTP_SERVER FTP_USERNAME FTP_PASSWORD FTP_SERVER_DIR; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (see site-deploy README)"
+            exit 1
+          fi
+          case "$FTP_SERVER_DIR" in
+            */) ;;
+            *) echo "::error::FTP_SERVER_DIR must end with /"; exit 1 ;;
+          esac
+          # all-inkl main accounts (w0...) see every domain of the account.
+          # Wiping from there would delete all sites, so clean-slate is only
+          # allowed with a per-domain FTP account.
+          if [ "$CLEAN_SLATE" = "true" ] && [[ "$FTP_USERNAME" =~ ^w0 ]]; then
+            echo "::error::clean-slate refused: FTP_USERNAME is an all-inkl main account. Use a per-domain FTP account."
+            exit 1
+          fi
+          # Credentials for the curl checks go through a config file so they never
+          # show up in the process list. curl config strings need \ and " escaped.
+          esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+          printf 'user = "%s:%s"\n' "$(esc "$FTP_USERNAME")" "$(esc "$FTP_PASSWORD")" > "$RUNNER_TEMP/ftp.curlrc"
+          dir="${FTP_SERVER_DIR#./}"
+          echo "FTP_URL=ftp://$FTP_SERVER/${dir#/}" >> "$GITHUB_ENV"
+
+      - name: Check server state
+        if: ${{ !inputs.clean-slate }}
+        run: |
+          # Downloaded rather than listed: listings may hide dotfiles, and a
+          # truncated file would pass a name check but still be ignored.
+          set +e
+          curl --silent --show-error --ssl-reqd --max-time 60 --config "$RUNNER_TEMP/ftp.curlrc" \
+            --output "$RUNNER_TEMP/state.json" "$FTP_URL$STATE_FILE"
+          rc=$?
+          set -e
+          if [ "$rc" = 78 ]; then
+            echo "::error::No $STATE_FILE on the server. For the first deploy run the workflow manually with clean-slate."
+            exit 1
+          elif [ "$rc" != 0 ]; then
+            echo "::error::Could not reach the server dir (curl exit $rc). Check FTP_SERVER, credentials and FTP_SERVER_DIR."
+            exit 1
+          fi
+          if ! jq -e '.data | type == "array"' "$RUNNER_TEMP/state.json" > /dev/null; then
+            echo "::error::$STATE_FILE on the server is unreadable. Run the workflow manually with clean-slate."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        if: inputs.build-command != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Build
+        if: inputs.build-command != ''
+        # Explicit bash adds pipefail, so a failing command in a pipe fails the build.
+        shell: bash
+        run: ${{ inputs.build-command }}
+
+      - name: Deploy
+        id: deploy
+        uses: SamKirkland/FTP-Deploy-Action@v4.4.0
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          security: strict
+          local-dir: ${{ inputs.publish-dir }}
+          server-dir: ${{ secrets.FTP_SERVER_DIR }}
+          state-name: ${{ env.STATE_FILE }}
+          dangerous-clean-slate: ${{ inputs.clean-slate }}
+          # Setting exclude replaces the action's defaults, so they are repeated.
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/node_modules/**
+            **/.DS_Store
+            **/README.md
+            **/readme.md
+            .vscode/**
+            ${{ inputs.exclude }}
+
+      - name: Verify clean slate
+        if: ${{ inputs.clean-slate && steps.deploy.outcome == 'success' }}
+        env:
+          PUBLISH_DIR: ${{ inputs.publish-dir }}
+        run: |
+          # After a wipe, every top-level entry on the server must come from
+          # this upload. Anything else survived a failed wipe.
+          listing=$(curl --silent --show-error --ssl-reqd --max-time 60 --list-only \
+            --config "$RUNNER_TEMP/ftp.curlrc" "$FTP_URL")
+          leftover=""
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            name="${name##*/}"
+            case "$name" in ""|.|..) continue ;; esac
+            [ -e "$PUBLISH_DIR/$name" ] || leftover="$leftover $name"
+          done <<< "$listing"
+          if [ -n "$leftover" ]; then
+            echo "::error::clean-slate did not remove:$leftover"
+            exit 1
+          fi
+
+      - name: Remove credentials file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ftp.curlrc"
